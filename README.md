@@ -138,7 +138,6 @@ b2-gpus --info h100
 ```
 
 ---
+Copyright © 2020-2026 Pittsburgh Supercomputing Center. All Rights Reserved.
 
-## License
-
-Copyright (C) 2026 Ivan Cao-Berg. Released under the GNU General Public License v2. See script headers for full license text.
+The [Biomedical Applications Group](https://www.psc.edu/biomedical-applications/) at the [Pittsburgh Supercomputing Center](http://www.psc.edu) in the [Mellon College of Science](https://www.cmu.edu/mcs/) at [Carnegie Mellon University](http://www.cmu.edu).
