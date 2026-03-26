@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# b2-gpus — Print GPU information for every SLURM partition on Bridges-2
+#
+# Copyright (C) 2026  Ivan Cao-Berg
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# -----------------------------------------------------------------------------
+# This script was improved using Claude AI (https://claude.ai)
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ── Load rich via module system ───────────────────────────────────────────────
+module load rich 2>/dev/null || true
+
+# ── GPU specs database ────────────────────────────────────────────────────────
+declare -A GPU_SPECS
+
+GPU_SPECS["h100"]="
+NVIDIA H100 SXM5|
+Architecture        | Hopper
+CUDA Cores          | 16,896
+Tensor Cores        | 528 (4th gen)
+GPU Memory          | 80 GB HBM3
+Memory Bandwidth    | 3.35 TB/s
+FP64 (double)       | 33.5 TFLOPS
+FP32 (single)       | 67 TFLOPS
+TF32               | 989 TFLOPS (sparse)
+BF16               | 1,979 TFLOPS (sparse)
+FP8                | 3,958 TFLOPS (sparse)
+INT8               | 3,958 TOPS (sparse)
+NVLink Bandwidth   | 900 GB/s
+TDP                | 700 W
+Form Factor        | SXM5
+Target Workload    | HPC / AI Training
+"
+
+GPU_SPECS["a100"]="
+NVIDIA A100 PCIe|
+Architecture        | Ampere
+CUDA Cores          | 6,912
+Tensor Cores        | 432 (3rd gen)
+GPU Memory          | 40 GB HBM2e
+Memory Bandwidth    | 1.6 TB/s
+FP64 (double)       | 19.5 TFLOPS
+FP32 (single)       | 19.5 TFLOPS
+TF32               | 312 TFLOPS (sparse)
+BF16               | 624 TFLOPS (sparse)
+INT8               | 1,248 TOPS (sparse)
+NVLink Bandwidth   | N/A
+TDP                | 300 W
+Form Factor        | PCIe
+Target Workload    | HPC / AI Training
+"
+
+GPU_SPECS["v100"]="
+NVIDIA V100 SXM2|
+Architecture        | Volta
+CUDA Cores          | 5,120
+Tensor Cores        | 640 (1st gen)
+GPU Memory          | 32 GB HBM2
+Memory Bandwidth    | 900 GB/s
+FP64 (double)       | 7.8 TFLOPS
+FP32 (single)       | 15.7 TFLOPS
+TF32               | N/A
+BF16               | N/A
+INT8               | 62 TOPS
+NVLink Bandwidth   | 300 GB/s
+TDP                | 300 W
+Form Factor        | SXM2
+Target Workload    | HPC / Deep Learning
+"
+
+GPU_SPECS["l40s"]="
+NVIDIA L40S|
+Architecture        | Ada Lovelace
+CUDA Cores          | 18,176
+Tensor Cores        | 568 (4th gen)
+GPU Memory          | 48 GB GDDR6
+Memory Bandwidth    | 864 GB/s
+FP64 (double)       | 1.46 TFLOPS
+FP32 (single)       | 91.6 TFLOPS
+TF32               | 183.2 TFLOPS (sparse)
+BF16               | 366.4 TFLOPS (sparse)
+INT8               | 733 TOPS (sparse)
+NVLink Bandwidth   | N/A
+TDP                | 350 W
+Form Factor        | PCIe
+Target Workload    | AI Inference / Visualization
+"
+
+GPU_SPECS["mi210"]="
+AMD Instinct MI210|
+Architecture        | CDNA2
+Stream Processors   | 6,656
+GPU Memory          | 64 GB HBM2e
+Memory Bandwidth    | 1.638 TB/s
+FP64 (double)       | 22.6 TFLOPS
+FP32 (single)       | 22.6 TFLOPS
+BF16               | 181.0 TFLOPS
+INT8               | 362.1 TOPS
+Infinity Fabric BW  | 400 GB/s
+TDP                | 300 W
+Form Factor        | OAM
+Target Workload    | HPC / AI Training
+"
+
+# ── SLURM partition / GRES type per GPU ──────────────────────────────────────
+declare -A GPU_PARTITION
+GPU_PARTITION["h100"]="ROBO"
+GPU_PARTITION["a100"]="GPU-dev"
+GPU_PARTITION["v100"]="GPU"
+GPU_PARTITION["l40s"]="GPU"
+GPU_PARTITION["mi210"]="HACC"
+
+declare -A GPU_GRES_TYPE
+GPU_GRES_TYPE["h100"]="h100"
+GPU_GRES_TYPE["a100"]="a100"
+GPU_GRES_TYPE["v100"]="v100-32"
+GPU_GRES_TYPE["l40s"]="l40s-48"
+GPU_GRES_TYPE["mi210"]="mi210"
+
+# ── Rich Python renderer ──────────────────────────────────────────────────────
+# rich_print MODE [ARGS...]
+#
+# Renders formatted output via an embedded Python script using the `rich`
+# library when available, falling back to plain text otherwise.
+#
+# Modes:
+#   rule   TITLE              — horizontal rule with centred title
+#   message MSG               — highlighted informational message
+#   error  MSG                — error message to stderr
+#   table                     — GPU node table read from stdin (5-column rows)
+#   info_table TITLE K V ...  — key/value spec panel for a GPU model
+#   sbatch SCRIPT             — syntax-highlighted sbatch example panel
+rich_print() {
+    local _rich_tmpscript
+    _rich_tmpscript=$(mktemp /tmp/rich_print_XXXXXX.py)
+    cat > "$_rich_tmpscript" <<'PYEOF'
+import sys
+import os
+
+mode = sys.argv[1]
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.rule import Rule
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+    from rich import box
+    console = Console()
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+def fallback(*args):
+    print(" ".join(str(a) for a in args))
+
+if mode == "rule":
+    title = sys.argv[2] if len(sys.argv) > 2 else ""
+    if HAS_RICH:
+        console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
+    else:
+        fallback(f"── {title} " + "─" * max(0, 60 - len(title)))
+
+elif mode == "message":
+    msg = sys.argv[2]
+    if HAS_RICH:
+        console.print(f"\n[bold green]⚡[/bold green] {msg}\n")
+    else:
+        fallback(msg)
+
+elif mode == "error":
+    msg = sys.argv[2]
+    if HAS_RICH:
+        console.print(f"[bold red]ERROR:[/bold red] {msg}", file=sys.stderr)
+    else:
+        print(f"ERROR: {msg}", file=sys.stderr)
+
+elif mode == "table":
+    rows = []
+    for line in sys.stdin:
+        parts = line.strip().split()
+        if len(parts) >= 5:
+            rows.append(parts)
+
+    merged = {}
+    for r in rows:
+        node, part, gres, state, avail = r[0], r[1], r[2], r[3], r[4]
+        if node in merged:
+            merged[node][1] += f", {part}"
+        else:
+            merged[node] = [node, part, gres, state, avail]
+
+    if not merged:
+        if HAS_RICH:
+            console.print("  [dim]No GPU nodes found[/dim]")
+        else:
+            print("  No GPU nodes found")
+        sys.exit(0)
+
+    if HAS_RICH:
+        table = Table(
+            title="[bold]GPU Nodes[/bold]",
+            box=box.ROUNDED,
+            header_style="bold magenta",
+            show_lines=True,
+        )
+        table.add_column("Node",      style="cyan",   no_wrap=True)
+        table.add_column("Partition", style="yellow")
+        table.add_column("GPU GRES",  style="green")
+        table.add_column("State",     style="bold")
+        table.add_column("Available", style="white")
+
+        state_colors = {
+            "idle":      "bold green",
+            "mixed":     "bold yellow",
+            "alloc":     "bold red",
+            "allocated": "bold red",
+            "drained":   "dim red",
+            "draining":  "dim red",
+            "down":      "bold red",
+            "maint":     "dim yellow",
+        }
+
+        for row in merged.values():
+            node, parts, gres, state, avail = row
+            color = state_colors.get(state.lower(), "white")
+            table.add_row(node, parts, gres, f"[{color}]{state}[/{color}]", avail)
+
+        console.print(table)
+    else:
+        print(f"{'NODE':<20} {'PARTITION':<30} {'GPU_GRES':<25} {'STATE':<10} {'AVAIL':<10}")
+        print("─" * 100)
+        for row in merged.values():
+            print(f"{row[0]:<20} {row[1]:<30} {row[2]:<25} {row[3]:<10} {row[4]:<10}")
+
+elif mode == "info_table":
+    title  = sys.argv[2]
+    pairs  = sys.argv[3:]
+    labels = pairs[0::2]
+    values = pairs[1::2]
+
+    if HAS_RICH:
+        table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        table.add_column("Label", style="bold cyan",  no_wrap=True, min_width=24)
+        table.add_column("Value", style="white")
+
+        for label, value in zip(labels, values):
+            table.add_row(label, value)
+
+        panel = Panel(
+            table,
+            title=f"[bold yellow]{title}[/bold yellow]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        )
+        console.print()
+        console.print(panel)
+        console.print("[dim]  Source: NVIDIA/AMD official product pages[/dim]\n")
+    else:
+        print(f"\n  {title}")
+        print("  " + "─" * 55)
+        for label, value in zip(labels, values):
+            print(f"  {label:<24} {value}")
+        print()
+
+elif mode == "sbatch":
+    script = sys.argv[2]
+    if HAS_RICH:
+        syntax = Syntax(script, "bash", theme="monokai", line_numbers=False)
+        panel = Panel(
+            syntax,
+            title="[bold yellow]Example sbatch script[/bold yellow]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        )
+        console.print(panel)
+        console.print("[dim]  Tip: save as job.sh and submit with: sbatch job.sh[/dim]\n")
+    else:
+        print("\n  Example sbatch script")
+        print("  " + "─" * 55)
+        print(script)
+        print()
+
+PYEOF
+    python3 "$_rich_tmpscript" "$@"
+    rm -f "$_rich_tmpscript"
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+# check_slurm
+# Exits with an error if the `sinfo` SLURM command is not on PATH.
+check_slurm() {
+    if ! command -v sinfo &>/dev/null; then
+        rich_print error "SLURM commands not found. Are you on a SLURM cluster?"
+        exit 1
+    fi
+}
+
+# get_partitions
+# Prints all unique SLURM partition names, one per line, sorted alphabetically.
+get_partitions() {
+    sinfo --noheader -o "%R" | sort -u
+}
+
+# print_gpu_info GPU_KEY
+# Renders a spec panel for the GPU identified by GPU_KEY (e.g. "h100", "a100").
+# Does nothing if GPU_KEY is not in GPU_SPECS.
+print_gpu_info() {
+    local key="${1,,}"
+    [[ -z "${GPU_SPECS[$key]+_}" ]] && return
+
+    local spec="${GPU_SPECS[$key]}"
+    local title
+    title=$(echo "$spec" | grep '|' | head -1 | cut -d'|' -f1 | xargs)
+
+    local args=("info_table" "$title")
+    while IFS='|' read -r label value; do
+        label=$(echo "$label" | xargs)
+        value=$(echo "$value" | xargs)
+        [[ -z "$label" && -z "$value" ]] && continue
+        args+=("$label" "$value")
+    done < <(echo "$spec" | grep '|' | tail -n +2)
+
+    rich_print "${args[@]}"
+}
+
+# print_sbatch_example GPU_KEY
+# Renders a syntax-highlighted example sbatch script for the given GPU_KEY,
+# using the correct partition and GRES type from GPU_PARTITION / GPU_GRES_TYPE.
+print_sbatch_example() {
+    local key="${1,,}"
+    local partition="${GPU_PARTITION[$key]:-GPU}"
+    local gres_type="${GPU_GRES_TYPE[$key]:-$key}"
+
+    local script
+    script="#!/usr/bin/env bash
+#SBATCH --job-name=my_job
+#SBATCH --partition=${partition}
+#SBATCH --gres=gpu:${gres_type}:1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=1:00:00
+#SBATCH --output=job_%j.out
+
+module purge
+module load cuda
+
+# Copy input data to local scratch for faster I/O
+tar -xf \$HOME/my_dataset.tar -C /local
+
+# Your commands here
+srun python train.py --data /local/my_dataset
+
+# Save results back to persistent storage
+tar -czf \$HOME/results_\${SLURM_JOB_ID}.tar.gz -C /local results"
+
+    rich_print sbatch "$script"
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+# usage
+# Prints the help text to stdout.
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  -p, --partition PARTITION  Filter nodes by partition name
+  -s, --state STATE          Filter nodes by state (e.g. idle, mixed, alloc)
+  -i, --info GPU             Print specs for a GPU (e.g. h100, a100, v100, l40s, mi210)
+  -h, --help                 Show this help message
+
+Available GPU names for --info:
+  $(echo "${!GPU_SPECS[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')
+EOF
+}
+
+# parse_args [OPTIONS...]
+# Parses command-line options and sets the global variables:
+#   FILTER_PARTITION — partition name to filter node output (empty = no filter)
+#   FILTER_STATE     — node state to filter node output (empty = no filter)
+#   INFO_GPU         — GPU key for the --info mode (empty = node-list mode)
+parse_args() {
+    FILTER_PARTITION=""
+    FILTER_STATE=""
+    INFO_GPU=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--partition) FILTER_PARTITION="${2,,}"; shift 2 ;;
+            -s|--state)     FILTER_STATE="${2,,}";     shift 2 ;;
+            -i|--info)      INFO_GPU="${2,,}";         shift 2 ;;
+            -h|--help)      usage; exit 0 ;;
+            *) rich_print error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+# main [OPTIONS...]
+# Entry point.  Dispatches to --info mode (print GPU specs + sbatch example)
+# or the default node-listing mode (query sinfo, filter, and render the table).
+main() {
+    parse_args "$@"
+
+    if [[ -n "$INFO_GPU" ]]; then
+        if [[ -z "${GPU_SPECS[$INFO_GPU]+_}" ]]; then
+            rich_print error "Unknown GPU: '$INFO_GPU'"
+            echo "Available GPUs: $(echo "${!GPU_SPECS[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')" >&2
+            exit 1
+        fi
+        print_gpu_info "$INFO_GPU"
+        print_sbatch_example "$INFO_GPU"
+        exit 0
+    fi
+
+    check_slurm
+
+    rich_print message "SLURM GPU nodes across all partitions on Bridges-2"
+
+    local sinfo_raw
+    sinfo_raw="$(sinfo -N --noheader -o "%N %R %G %T %a")"
+
+    # ── Single unified table ──────────────────────────────────────────────────
+    local node_rows
+    node_rows="$(echo "$sinfo_raw" \
+        | awk 'tolower($3) ~ /gpu/' \
+        | sort -k1,1 -k2,2)"
+
+    # Apply partition filter ($2 is partition, $4 is state)
+    if [[ -n "$FILTER_PARTITION" ]]; then
+        node_rows="$(echo "$node_rows" | awk -v p="$FILTER_PARTITION" 'tolower($2) == p')"
+    fi
+    if [[ -n "$FILTER_STATE" ]]; then
+        node_rows="$(echo "$node_rows" | awk -v s="$FILTER_STATE" 'tolower($4) == s')"
+    fi
+
+    echo "$node_rows" | rich_print table
+
+    # ── Collect unique GPU types ──────────────────────────────────────────────
+    local -A seen_gpu_types
+    while IFS= read -r gpu_type; do
+        [[ -n "$gpu_type" ]] && seen_gpu_types["$gpu_type"]=1
+    done < <(
+        echo "$node_rows" \
+            | awk '
+                tolower($3) ~ /gpu/ {
+                    split($3, g, ":")
+                    if (length(g) >= 2) print g[2]
+                }
+            ' | sort -u
+    )
+
+}
+
+main "$@"
